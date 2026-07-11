@@ -137,7 +137,7 @@ export default function App() {
     setAuditLog("API REQUEST DISPATCHED TO FASTAPI BACKEND...");
 
     try {
-      const response = await fetch("http://localhost:8000//api/v1/support/chat", {
+      const response = await fetch("https://gigacorp-ai.vercel.app/api/v1/support/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -212,7 +212,7 @@ export default function App() {
     formData.append("case_id", activeCase.id);
 
     try {
-      const response = await fetch("http://localhost:8000//api/v1/support/upload", {
+      const response = await fetch("https://gigacorp-ai.vercel.app/api/v1/support/upload", {
         method: "POST",
         body: formData
       });
