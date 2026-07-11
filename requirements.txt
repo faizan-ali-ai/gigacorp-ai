@@ -5,9 +5,9 @@ google-generativeai
 langchain-groq
 langchain-text-splitters
 langchain-community
+langchain-google-genai
 chromadb
 docx2txt
 pypdf
-sentence-transformers
 python-multipart
 gunicorn
