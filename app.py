@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
+import chromadb
 import google.generativeai as genai
 
 from langchain_groq import ChatGroq
@@ -101,6 +101,12 @@ text_splitter = RecursiveCharacterTextSplitter(
 COLLECTION_NAME = "gigacorp_core_gemini_v2"
 
 
+
+
+
+chroma_client = chromadb.EphemeralClient()
+
+
 if os.path.exists("knowledge_base.docx"):
 
     base_loader = Docx2txtLoader(
@@ -116,14 +122,16 @@ if os.path.exists("knowledge_base.docx"):
     vector_db = Chroma.from_documents(
         documents=base_chunks,
         embedding=embedding_model,
-        collection_name=COLLECTION_NAME
+        collection_name=COLLECTION_NAME,
+        client=chroma_client
     )
 
 else:
 
     vector_db = Chroma(
         embedding_function=embedding_model,
-        collection_name=COLLECTION_NAME
+        collection_name=COLLECTION_NAME,
+        client=chroma_client
     )
 
 
@@ -178,39 +186,38 @@ async def upload_company_knowledge_pdf(
     file: UploadFile,
     case_id: str = Form(...)
 ):
+    temp_file_path = None
 
     try:
-
-        if not file.filename.lower().endswith(".pdf"):
-
+        if (
+            not file.filename
+            or not file.filename.lower().endswith(".pdf")
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Only PDF file formats are accepted."
             )
 
-
         safe_filename = (
-            f"case_{case_id}_{Path(file.filename).name}"
+            f"case_{case_id}_"
+            f"{Path(file.filename).name}"
         )
 
-        target_file_path = (
-            DATA_DIR / safe_filename
+        temp_file_path = (
+            Path("/tmp") / safe_filename
         )
-
 
         with open(
-            target_file_path,
+            temp_file_path,
             "wb"
         ) as buffer:
-
             shutil.copyfileobj(
                 file.file,
                 buffer
             )
 
-
         pdf_loader = PyPDFLoader(
-            str(target_file_path)
+            str(temp_file_path)
         )
 
         pdf_documents = pdf_loader.load()
@@ -221,16 +228,12 @@ async def upload_company_knowledge_pdf(
             )
         )
 
-
         for chunk in pdf_chunks:
-
             chunk.metadata["case_id"] = case_id
-
 
         vector_db.add_documents(
             pdf_chunks
         )
-
 
         return {
             "status": "SUCCESS",
@@ -238,17 +241,13 @@ async def upload_company_knowledge_pdf(
                 f"File {file.filename} compiled and "
                 "appended to dynamic vector workspace."
             ),
-            "filepath": str(target_file_path),
             "chunks_ingested": len(pdf_chunks)
         }
-
 
     except HTTPException:
         raise
 
-
     except Exception as error:
-
         print(
             "\n"
             + "=" * 50
@@ -260,7 +259,6 @@ async def upload_company_knowledge_pdf(
 
         print("=" * 127 + "\n")
 
-
         raise HTTPException(
             status_code=500,
             detail=(
@@ -269,6 +267,15 @@ async def upload_company_knowledge_pdf(
             )
         )
 
+    finally:
+        if (
+            temp_file_path
+            and temp_file_path.exists()
+        ):
+            try:
+                temp_file_path.unlink()
+            except Exception:
+                pass
 
 
 @app.post("/api/v1/support/chat")
