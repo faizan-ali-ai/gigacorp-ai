@@ -45,8 +45,12 @@ class ConfigurationError(Exception):
     pass
 
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("/tmp/gigacorp_data")
+
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
 MEMORY_FILE = Path("chat_memory.json")
 
