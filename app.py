@@ -1,29 +1,52 @@
 import os
-import json
 import shutil
+import tempfile
 import traceback
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
-import chromadb
+import psycopg2
 import google.generativeai as genai
 
+from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    Form
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel
+
 from langchain_groq import ChatGroq
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from langchain_text_splitters import (
+    RecursiveCharacterTextSplitter
+)
+
+from langchain_community.document_loaders import (
+    Docx2txtLoader,
+    PyPDFLoader
+)
+
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings
+)
 
 
 load_dotenv()
 
 
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+
 app = FastAPI(
     title="GigaCorp Enterprise Support API Engine",
-    version="6.0.0"
+    version="7.0.0"
 )
 
 
@@ -36,6 +59,11 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
+
 class ChatQueryRequest(BaseModel):
     case_id: str
     message: str
@@ -45,47 +73,145 @@ class ConfigurationError(Exception):
     pass
 
 
-DATA_DIR = Path("/tmp/gigacorp_data")
+# ============================================================
+# ENVIRONMENT CONFIGURATION
+# ============================================================
 
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+GEMINI_EMBEDDING_KEY = os.getenv(
+    "GEMINI_KEY_1"
 )
 
-MEMORY_FILE = Path("chat_memory.json")
 
+if not DATABASE_URL:
+    raise ConfigurationError(
+        "DATABASE_URL environment variable is missing."
+    )
 
-def load_thread_memory():
-    if MEMORY_FILE.exists():
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as file:
-                return json.load(file)
-        except Exception:
-            return {}
-
-    return {}
-
-
-def save_thread_memory(memory_data):
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as file:
-            json.dump(
-                memory_data,
-                file,
-                indent=4,
-                ensure_ascii=False
-            )
-
-    except Exception as error:
-        print(f"Memory Sync Error: {str(error)}")
-
-
-GEMINI_EMBEDDING_KEY = os.getenv("GEMINI_KEY_1")
 
 if not GEMINI_EMBEDDING_KEY:
     raise ConfigurationError(
         "GEMINI_KEY_1 environment variable is missing."
     )
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+
+def get_database_connection():
+
+    return psycopg2.connect(
+        DATABASE_URL
+    )
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+
+def initialize_database():
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute(
+            """
+            CREATE EXTENSION IF NOT EXISTS vector;
+            """
+        )
+
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_documents
+            (
+                id BIGSERIAL PRIMARY KEY,
+
+                case_id TEXT,
+
+                content TEXT NOT NULL,
+
+                source TEXT,
+
+                embedding VECTOR(768) NOT NULL,
+
+                created_at TIMESTAMPTZ
+                DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_memory
+            (
+                id BIGSERIAL PRIMARY KEY,
+
+                case_id TEXT NOT NULL,
+
+                user_input TEXT NOT NULL,
+
+                assistant_output TEXT NOT NULL,
+
+                created_at TIMESTAMPTZ
+                DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_knowledge_documents_case_id
+
+            ON knowledge_documents(case_id);
+            """
+        )
+
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_memory_case_id
+
+            ON chat_memory(case_id);
+            """
+        )
+
+
+        connection.commit()
+
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+initialize_database()
+
+
+# ============================================================
+# EMBEDDING MODEL
+# ============================================================
 
 
 embedding_model = GoogleGenerativeAIEmbeddings(
@@ -95,6 +221,10 @@ embedding_model = GoogleGenerativeAIEmbeddings(
 )
 
 
+# ============================================================
+# TEXT SPLITTER
+# ============================================================
+
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
@@ -102,41 +232,432 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 
-COLLECTION_NAME = "gigacorp_core_gemini_v2"
+# ============================================================
+# VECTOR HELPERS
+# ============================================================
 
 
+def vector_to_postgres(
+    embedding
+):
+
+    return (
+        "["
+        + ",".join(
+            str(float(value))
+            for value in embedding
+        )
+        + "]"
+    )
 
 
+# ============================================================
+# DOCUMENT STORAGE
+# ============================================================
 
-chroma_client = chromadb.EphemeralClient()
+
+def add_documents_to_database(
+    documents,
+    case_id=None,
+    source=None
+):
+
+    if not documents:
+        return 0
 
 
-if os.path.exists("knowledge_base.docx"):
+    document_texts = [
 
-    base_loader = Docx2txtLoader(
+        document.page_content
+
+        for document in documents
+
+    ]
+
+
+    embeddings = (
+        embedding_model.embed_documents(
+            document_texts
+        )
+    )
+
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+
+    try:
+
+        for document, embedding in zip(
+            documents,
+            embeddings
+        ):
+
+            cursor.execute(
+                """
+                INSERT INTO knowledge_documents
+                (
+                    case_id,
+                    content,
+                    source,
+                    embedding
+                )
+
+                VALUES
+                (
+                    %s,
+                    %s,
+                    %s,
+                    %s::vector
+                );
+                """,
+                (
+                    case_id,
+                    document.page_content,
+                    source,
+                    vector_to_postgres(
+                        embedding
+                    )
+                )
+            )
+
+
+        connection.commit()
+
+
+        return len(documents)
+
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+# ============================================================
+# VECTOR SIMILARITY SEARCH
+# ============================================================
+
+
+def similarity_search(
+    query,
+    case_id=None,
+    limit=3
+):
+
+    query_embedding = (
+        embedding_model.embed_query(
+            query
+        )
+    )
+
+
+    postgres_vector = vector_to_postgres(
+        query_embedding
+    )
+
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+
+    try:
+
+        if case_id:
+
+            cursor.execute(
+                """
+                SELECT
+                    content,
+                    source
+
+                FROM knowledge_documents
+
+                WHERE case_id = %s
+
+                ORDER BY
+                    embedding <=> %s::vector
+
+                LIMIT %s;
+                """,
+                (
+                    case_id,
+                    postgres_vector,
+                    limit
+                )
+            )
+
+
+        else:
+
+            cursor.execute(
+                """
+                SELECT
+                    content,
+                    source
+
+                FROM knowledge_documents
+
+                ORDER BY
+                    embedding <=> %s::vector
+
+                LIMIT %s;
+                """,
+                (
+                    postgres_vector,
+                    limit
+                )
+            )
+
+
+        rows = cursor.fetchall()
+
+
+        return [
+
+            {
+                "content": row[0],
+                "source": row[1]
+            }
+
+            for row in rows
+
+        ]
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+# ============================================================
+# CHAT MEMORY
+# ============================================================
+
+
+def load_thread_memory(
+    case_id,
+    limit=3
+):
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+
+    try:
+
+        cursor.execute(
+            """
+            SELECT
+                user_input,
+                assistant_output
+
+            FROM chat_memory
+
+            WHERE case_id = %s
+
+            ORDER BY id DESC
+
+            LIMIT %s;
+            """,
+            (
+                case_id,
+                limit
+            )
+        )
+
+
+        rows = cursor.fetchall()
+
+        rows.reverse()
+
+
+        return [
+
+            {
+                "input": row[0],
+                "output": row[1]
+            }
+
+            for row in rows
+
+        ]
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+def save_thread_memory(
+    case_id,
+    user_input,
+    assistant_output
+):
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO chat_memory
+            (
+                case_id,
+                user_input,
+                assistant_output
+            )
+
+            VALUES
+            (
+                %s,
+                %s,
+                %s
+            );
+            """,
+            (
+                case_id,
+                user_input,
+                assistant_output
+            )
+        )
+
+
+        connection.commit()
+
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+# ============================================================
+# BASE KNOWLEDGE INITIALIZATION
+# ============================================================
+
+
+def initialize_base_knowledge():
+
+    knowledge_file = Path(
         "knowledge_base.docx"
     )
 
-    base_documents = base_loader.load()
 
-    base_chunks = text_splitter.split_documents(
-        base_documents
+    if not knowledge_file.exists():
+
+        return
+
+
+    connection = get_database_connection()
+
+    cursor = connection.cursor()
+
+
+    try:
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+
+            FROM knowledge_documents
+
+            WHERE source = %s;
+            """,
+            (
+                "knowledge_base.docx",
+            )
+        )
+
+
+        existing_documents = (
+            cursor.fetchone()[0]
+        )
+
+
+    finally:
+
+        cursor.close()
+
+        connection.close()
+
+
+    if existing_documents > 0:
+
+        print(
+            "Base knowledge already initialized."
+        )
+
+        return
+
+
+    print(
+        "Initializing base knowledge..."
     )
 
-    vector_db = Chroma.from_documents(
+
+    base_loader = Docx2txtLoader(
+        str(knowledge_file)
+    )
+
+
+    base_documents = (
+        base_loader.load()
+    )
+
+
+    base_chunks = (
+        text_splitter.split_documents(
+            base_documents
+        )
+    )
+
+
+    add_documents_to_database(
         documents=base_chunks,
-        embedding=embedding_model,
-        collection_name=COLLECTION_NAME,
-        client=chroma_client
+        case_id=None,
+        source="knowledge_base.docx"
     )
 
-else:
 
-    vector_db = Chroma(
-        embedding_function=embedding_model,
-        collection_name=COLLECTION_NAME,
-        client=chroma_client
+    print(
+        f"Base knowledge initialized: "
+        f"{len(base_chunks)} chunks."
     )
+
+
+initialize_base_knowledge()
+
+
+# ============================================================
+# LLM PROVIDER POOL
+# ============================================================
 
 
 def get_pooled_llm_runtime(
@@ -144,35 +665,47 @@ def get_pooled_llm_runtime(
     provider_allocation
 ):
 
-    if provider_allocation["provider"] == "gemini":
+    if (
+        provider_allocation["provider"]
+        == "gemini"
+    ):
 
         genai.configure(
             api_key=provider_allocation["key"]
         )
 
+
         model = genai.GenerativeModel(
             provider_allocation["model"]
         )
+
 
         response = model.generate_content(
             prompt_text
         )
 
+
         return response.text
 
-    else:
 
-        llm = ChatGroq(
-            model=provider_allocation["model"],
-            groq_api_key=provider_allocation["key"],
-            temperature=0
-        )
+    llm = ChatGroq(
+        model=provider_allocation["model"],
+        groq_api_key=provider_allocation["key"],
+        temperature=0
+    )
 
-        response = llm.invoke(
-            prompt_text
-        )
 
-        return response.content
+    response = llm.invoke(
+        prompt_text
+    )
+
+
+    return response.content
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 
 @app.get("/")
@@ -180,51 +713,83 @@ async def health_check():
 
     return {
         "status": "ONLINE",
-        "service": "GigaCorp Enterprise Support API",
-        "version": "6.0.0"
+        "service": (
+            "GigaCorp Enterprise Support API"
+        ),
+        "version": "7.0.0",
+        "database": "Neon PostgreSQL",
+        "vector_engine": "pgvector"
     }
 
 
-@app.post("/api/v1/support/upload")
+# ============================================================
+# PDF KNOWLEDGE UPLOAD
+# ============================================================
+
+
+@app.post(
+    "/api/v1/support/upload"
+)
 async def upload_company_knowledge_pdf(
     file: UploadFile,
     case_id: str = Form(...)
 ):
+
     temp_file_path = None
 
+
     try:
+
         if (
             not file.filename
-            or not file.filename.lower().endswith(".pdf")
+            or not file.filename
+            .lower()
+            .endswith(".pdf")
         ):
+
             raise HTTPException(
                 status_code=400,
-                detail="Only PDF file formats are accepted."
+                detail=(
+                    "Only PDF file formats "
+                    "are accepted."
+                )
             )
+
 
         safe_filename = (
             f"case_{case_id}_"
             f"{Path(file.filename).name}"
         )
 
+
         temp_file_path = (
-            Path("/tmp") / safe_filename
+            Path(
+                tempfile.gettempdir()
+            )
+            / safe_filename
         )
+
 
         with open(
             temp_file_path,
             "wb"
         ) as buffer:
+
             shutil.copyfileobj(
                 file.file,
                 buffer
             )
 
+
         pdf_loader = PyPDFLoader(
             str(temp_file_path)
         )
 
-        pdf_documents = pdf_loader.load()
+
+        pdf_documents = (
+            pdf_loader.load()
+        )
+
 
         pdf_chunks = (
             text_splitter.split_documents(
@@ -232,26 +797,35 @@ async def upload_company_knowledge_pdf(
             )
         )
 
-        for chunk in pdf_chunks:
-            chunk.metadata["case_id"] = case_id
 
-        vector_db.add_documents(
-            pdf_chunks
+        chunks_ingested = (
+            add_documents_to_database(
+                documents=pdf_chunks,
+                case_id=case_id,
+                source=file.filename
+            )
         )
+
 
         return {
             "status": "SUCCESS",
             "message": (
-                f"File {file.filename} compiled and "
-                "appended to dynamic vector workspace."
+                f"File {file.filename} compiled "
+                "and stored in Neon pgvector."
             ),
-            "chunks_ingested": len(pdf_chunks)
+            "chunks_ingested": (
+                chunks_ingested
+            )
         }
 
+
     except HTTPException:
+
         raise
 
+
     except Exception as error:
+
         print(
             "\n"
             + "=" * 50
@@ -259,9 +833,15 @@ async def upload_company_knowledge_pdf(
             + "=" * 50
         )
 
+
         traceback.print_exc()
 
-        print("=" * 127 + "\n")
+
+        print(
+            "=" * 127
+            + "\n"
+        )
+
 
         raise HTTPException(
             status_code=500,
@@ -271,18 +851,31 @@ async def upload_company_knowledge_pdf(
             )
         )
 
+
     finally:
+
         if (
             temp_file_path
             and temp_file_path.exists()
         ):
+
             try:
+
                 temp_file_path.unlink()
+
             except Exception:
+
                 pass
 
 
-@app.post("/api/v1/support/chat")
+# ============================================================
+# CUSTOMER SUPPORT CHAT
+# ============================================================
+
+
+@app.post(
+    "/api/v1/support/chat"
+)
 async def process_customer_support_query(
     payload: ChatQueryRequest
 ):
@@ -293,75 +886,83 @@ async def process_customer_support_query(
 
         case_id = payload.case_id
 
-        chat_memory = load_thread_memory()
+
+        chat_history = load_thread_memory(
+            case_id=case_id,
+            limit=3
+        )
 
 
-        if case_id in chat_memory:
+        for turn in chat_history:
 
-            turns = chat_memory[case_id]
-
-            for turn in turns[-3:]:
-
-                previous_history += (
-                    f"User: {turn['input']}\n"
-                    f"Assistant: {turn['output']}\n"
-                )
-
-
-        retrieved_docs = (
-            vector_db.similarity_search(
-                payload.message,
-                k=3,
-                filter={
-                    "case_id": case_id
-                }
+            previous_history += (
+                f"User: {turn['input']}\n"
+                f"Assistant: "
+                f"{turn['output']}\n"
             )
+
+
+        retrieved_docs = similarity_search(
+            query=payload.message,
+            case_id=case_id,
+            limit=3
         )
 
 
         if not retrieved_docs:
 
             retrieved_docs = (
-                vector_db.similarity_search(
-                    payload.message,
-                    k=3
+                similarity_search(
+                    query=payload.message,
+                    limit=3
                 )
             )
 
 
         context_block = "\n\n".join(
-            document.page_content
+
+            document["content"]
+
             for document in retrieved_docs
+
         )
 
 
         full_system_prompt = (
 
-            "You are an expert customer support assistant "
-            "for GigaCorp Technologies.\n"
+            "You are an expert customer support "
+            "assistant for GigaCorp Technologies.\n"
 
-            "CRITICAL DIRECTIVE: Your response must be "
-            "strictly concise, direct, and to-the-point. "
-            "Answer ONLY what the user is currently asking. "
-            "Do not summarize previous context or repeat "
-            "user identity details unless explicitly requested.\n"
+            "CRITICAL DIRECTIVE: Your response "
+            "must be strictly concise, direct, "
+            "and to-the-point. "
 
-            "If the user asks a factual question about "
-            "GigaCorp, provide only the factual answer "
-            "from the retrieved context.\n"
+            "Answer ONLY what the user is "
+            "currently asking. "
 
-            "If the user asks for a specific piece of "
-            "information, reply with the direct answer "
-            "without unnecessary conversational filler.\n"
+            "Do not summarize previous context "
+            "or repeat user identity details "
+            "unless explicitly requested.\n"
 
-            "Always cite the section title or heading "
-            "from the context when providing corporate "
-            "information.\n\n"
+            "If the user asks a factual question "
+            "about GigaCorp, provide only the "
+            "factual answer from the retrieved "
+            "context.\n"
+
+            "If the user asks for a specific "
+            "piece of information, reply with "
+            "the direct answer without unnecessary "
+            "conversational filler.\n"
+
+            "Always cite the section title or "
+            "heading from the context when "
+            "providing corporate information.\n\n"
 
             f"Retrieved Context:\n"
             f"{context_block}\n\n"
 
             f"Previous Chat History:\n"
+
             f"{previous_history if previous_history else 'No previous interaction.'}\n\n"
 
             f"User's Current Question: "
@@ -373,20 +974,32 @@ async def process_customer_support_query(
 
             {
                 "provider": "gemini",
-                "key": os.getenv("GEMINI_KEY_1"),
-                "model": "gemini-1.5-flash"
+                "key": os.getenv(
+                    "GEMINI_KEY_1"
+                ),
+                "model": (
+                    "gemini-1.5-flash"
+                )
             },
 
             {
                 "provider": "gemini",
-                "key": os.getenv("GEMINI_KEY_2"),
-                "model": "gemini-1.5-flash"
+                "key": os.getenv(
+                    "GEMINI_KEY_2"
+                ),
+                "model": (
+                    "gemini-1.5-flash"
+                )
             },
 
             {
                 "provider": "groq",
-                "key": os.getenv("GROQ_KEY_1"),
-                "model": "llama-3.1-8b-instant"
+                "key": os.getenv(
+                    "GROQ_KEY_1"
+                ),
+                "model": (
+                    "llama-3.1-8b-instant"
+                )
             }
 
         ]
@@ -410,6 +1023,7 @@ async def process_customer_support_query(
 
 
                     if execution_response_text:
+
                         break
 
 
@@ -421,6 +1035,7 @@ async def process_customer_support_query(
                         f"{str(provider_error)}"
                     )
 
+
                     continue
 
 
@@ -431,37 +1046,22 @@ async def process_customer_support_query(
             )
 
 
-        if case_id not in chat_memory:
-
-            chat_memory[case_id] = []
-
-
-        chat_memory[case_id].append({
-
-            "input": payload.message,
-
-            "output": execution_response_text
-
-        })
-
-
         save_thread_memory(
-            chat_memory
+            case_id=case_id,
+            user_input=payload.message,
+            assistant_output=(
+                execution_response_text
+            )
         )
 
 
         return {
-
             "status": "SUCCESS",
-
             "case_id": case_id,
-
             "answer": execution_response_text,
-
             "citations_count": len(
                 retrieved_docs
             )
-
         }
 
 
@@ -482,9 +1082,14 @@ async def process_customer_support_query(
             + "=" * 50
         )
 
+
         traceback.print_exc()
 
-        print("=" * 122 + "\n")
+
+        print(
+            "=" * 122
+            + "\n"
+        )
 
 
         raise HTTPException(
@@ -493,11 +1098,15 @@ async def process_customer_support_query(
         )
 
 
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
 
 
 if __name__ == "__main__":
 
     import uvicorn
+
 
     uvicorn.run(
         app,
